@@ -1,0 +1,15 @@
+This project uses a modified version of the Fetal Ultrasound Brain Dataset, originally available on Kaggle.
+
+** Original Dataset **
+https://www.kaggle.com/datasets/rahimalargo/fetalultrasoundbrain
+
+However, many of the original images contained noise and unwanted artifacts.
+To improve model performance, I manually filtered and selected 1,647 high-quality images that are better suited for training.
+
+The refined dataset is organized into three subsets:
+
+** Training Set **
+https://drive.google.com/drive/folders/1CPShR_tcG6mt8ItTX8xBRCUoM2Xr-E7E?usp=drive_link
+
+** Testing Set **
+https://drive.google.com/drive/folders/18Fw7eYuLKpx1BCaQ8Dtw500-xQCmx3u_?usp=drive_link
