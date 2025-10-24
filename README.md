@@ -19,6 +19,9 @@ It is recommended to create a **virtual environment** before installing the requ
    - `train_model.py`
    - `requirements.txt`
    - `README.md`
+
+  ### And download the training and testing datasets from kaggle or drive,where instructions are provided to download in dataset.txt file ###
+  ** place the classification and classification_test folders in the project folder **
    classification folder for dataset
    classification_test to test on unseen data
 ---
