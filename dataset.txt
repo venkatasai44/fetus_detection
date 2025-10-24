@@ -13,3 +13,5 @@ https://drive.google.com/drive/folders/1CPShR_tcG6mt8ItTX8xBRCUoM2Xr-E7E?usp=dri
 
 ** Testing Set **
 https://drive.google.com/drive/folders/18Fw7eYuLKpx1BCaQ8Dtw500-xQCmx3u_?usp=drive_link
+
+*** MAKE SURE THAT THESE 2 DATASET FOLDERS NEED TO BE IN YOUR PROJECT FOLDER ***
