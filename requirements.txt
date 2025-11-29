@@ -2,7 +2,8 @@ tensorflow==2.15
 numpy
 matplotlib
 seaborn
+pandas
 scikit-learn
-psutil
 opencv-python
+pillow
 tqdm
