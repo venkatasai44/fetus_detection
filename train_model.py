@@ -1,55 +1,61 @@
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from PIL import Image
+import cv2
 
 import tensorflow as tf
-import numpy as np
-import os
-import matplotlib.pyplot as plt
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D
 from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, precision_recall_curve
-import seaborn as sns
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, CSVLogger
 from tensorflow.keras.utils import to_categorical
-import time
 
-import tensorflow as tf
-import numpy as np
-import random
-import os
+from sklearn.metrics import (
+    classification_report, confusion_matrix, roc_curve, auc,
+    precision_recall_curve
+)
+from sklearn.preprocessing import label_binarize
+from collections import Counter
 
-# Fix random seeds for reproducibility
-seed = 42
-np.random.seed(seed)
-tf.random.set_seed(seed)
-random.seed(seed)
-os.environ['PYTHONHASHSEED'] = str(seed)
-
-
-# ==============================
-# 1️⃣ Paths and Parameters
-# ==============================
-DATASET_PATH = "classification"        # Folder containing subfolders for each class
-TEST_PATH = "classification_test"      # Folder for unseen test data
-MODEL_SAVE_PATH = "fetus_growth_model.keras"
+# -----------------------------
+# ✅ Paths & Settings
+# -----------------------------
+DATASET_PATH = "classification"
+TEST_PATH = "classification_test"
+OUTPUT_DIR = "outputs"
+MODEL_SAVE_PATH = os.path.join(OUTPUT_DIR, "fetus_growth_model.keras")
+HISTORY_CSV = os.path.join(OUTPUT_DIR, "training_history.csv")
 
 IMG_SIZE = (128, 128)
 BATCH_SIZE = 32
 EPOCHS = 50
+SEED = 42
 
-# ==============================
-# 2️⃣ Data Generators
-# ==============================
+FINE_TUNE = False
+FINE_TUNE_AT = 100
+
+GRADCAM_SAVE_DIR = os.path.join(OUTPUT_DIR, "gradcam_overlays")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(GRADCAM_SAVE_DIR, exist_ok=True)
+
+# -----------------------------
+# 🔁 Data Generators
+# -----------------------------
 train_datagen = ImageDataGenerator(
     rescale=1./255,
     rotation_range=20,
-    width_shift_range=0.2,
-    height_shift_range=0.2,
-    shear_range=0.2,
-    zoom_range=0.2,
+    width_shift_range=0.12,
+    height_shift_range=0.12,
+    shear_range=0.1,
+    zoom_range=0.15,
     horizontal_flip=True,
-    fill_mode='nearest',
-    validation_split=0.2   # Split 80% train, 20% validation
+    validation_split=0.2
 )
 
 train_generator = train_datagen.flow_from_directory(
@@ -57,7 +63,8 @@ train_generator = train_datagen.flow_from_directory(
     target_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
     class_mode='categorical',
-    subset="training"
+    subset="training",
+    seed=SEED
 )
 
 val_generator = train_datagen.flow_from_directory(
@@ -65,314 +72,188 @@ val_generator = train_datagen.flow_from_directory(
     target_size=IMG_SIZE,
     batch_size=BATCH_SIZE,
     class_mode='categorical',
-    subset="validation"
+    subset="validation",
+    seed=SEED
 )
 
-# ==============================
-# 3️⃣ Load Pretrained Model (MobileNetV2)
-# ==============================
-base_model = MobileNetV2(input_shape=(128, 128, 3), include_top=False, weights='imagenet')
-base_model.trainable = False  # Freeze base model layers
+# -----------------------------
+# ⚖️ Class Weights
+# -----------------------------
+train_labels = train_generator.classes
+class_counts = Counter(train_labels)
+total = float(sum(class_counts.values()))
+class_weights = {cls: total / (len(class_counts) * count) for cls, count in class_counts.items()}
+
+print("Class counts:", class_counts)
+print("Class weights:", class_weights)
+
+# -----------------------------
+# 🏗 Model: MobileNetV2
+# -----------------------------
+base_model = MobileNetV2(
+    input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3),
+    include_top=False,
+    weights='imagenet'
+)
+base_model.trainable = False
 
 x = base_model.output
 x = GlobalAveragePooling2D()(x)
 x = Dense(128, activation='relu')(x)
 x = Dropout(0.5)(x)
-output_layer = Dense(train_generator.num_classes, activation='softmax')(x)
+output = Dense(train_generator.num_classes, activation='softmax')(x)
 
-model = Model(inputs=base_model.input, outputs=output_layer)
+model = Model(inputs=base_model.input, outputs=output)
 
-# Show model summary (for report computational requirements)
-model.summary()
-
-# ==============================
-# 4️⃣ Compile Model
-# ==============================
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
+    optimizer=tf.keras.optimizers.Adam(1e-4),
     loss='categorical_crossentropy',
     metrics=['accuracy']
 )
 
-# ==============================
-# 5️⃣ Callbacks
-# ==============================
-early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-checkpoint = ModelCheckpoint(MODEL_SAVE_PATH, save_best_only=True, monitor='val_accuracy')
-lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-6)
+model.summary()
 
-# ==============================
-# 6️⃣ Train Model
-# ==============================
-start_time = time.time()
+# -----------------------------
+# 🛠 Callbacks
+# -----------------------------
+early_stopping = EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True)
+checkpoint = ModelCheckpoint(MODEL_SAVE_PATH, save_best_only=True, monitor='val_accuracy')
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+csv_logger = CSVLogger(HISTORY_CSV)
+
+callbacks = [early_stopping, checkpoint, reduce_lr, csv_logger]
+
+# -----------------------------
+# 🚀 Train
+# -----------------------------
+start = time.time()
 history = model.fit(
     train_generator,
     validation_data=val_generator,
     epochs=EPOCHS,
-    callbacks=[early_stopping, checkpoint, lr_scheduler]
+    callbacks=callbacks,
+    class_weight=class_weights
 )
-end_time = time.time()
-training_time = end_time - start_time
-print(f"\n🕒 Total training time: {training_time/60:.2f} minutes\n")
+end = time.time()
+print(f"Training time: {(end-start)/60:.2f} minutes")
 
-# ==============================
-# 7️⃣ Plot Accuracy & Loss
-# ==============================
-plt.figure(figsize=(8,5))
-plt.plot(history.history['accuracy'], label='Train Accuracy', marker='o')
-plt.plot(history.history['val_accuracy'], label='Validation Accuracy', marker='s')
-plt.title('Accuracy vs Epochs')
-plt.xlabel('Epochs')
-plt.ylabel('Accuracy')
-plt.legend()
-plt.grid(True)
-plt.show()
+pd.DataFrame(history.history).to_csv(HISTORY_CSV, index=False)
 
-plt.figure(figsize=(8,5))
-plt.plot(history.history['loss'], label='Train Loss', marker='o')
-plt.plot(history.history['val_loss'], label='Validation Loss', marker='s')
-plt.title('Loss vs Epochs')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
-plt.grid(True)
-plt.show()
+# -----------------------------
+# 📊 Plot Training Curves
+# -----------------------------
+def plot_history(history):
+    plt.figure()
+    plt.plot(history['accuracy'], label='Train Acc')
+    plt.plot(history['val_accuracy'], label='Val Acc')
+    plt.legend()
+    plt.title("Accuracy")
+    plt.show()
 
-# ==============================
-# 8️⃣ Evaluate on Validation Data
-# ==============================
-val_loss, val_acc = model.evaluate(val_generator)
-print(f"Validation Accuracy: {val_acc:.2%}")
+    plt.figure()
+    plt.plot(history['loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Val Loss')
+    plt.legend()
+    plt.title("Loss")
+    plt.show()
 
-# ==============================
-# 9️⃣ Evaluate on Unseen (Test) Data
-# ==============================
-if os.path.exists(TEST_PATH):
-    test_datagen = ImageDataGenerator(rescale=1./255)
-    test_generator = test_datagen.flow_from_directory(
-        TEST_PATH,
-        target_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode='categorical',
-        shuffle=False
+plot_history(history.history)
+
+# -----------------------------
+# 🔥 GRAD-CAM (UPDATED: ALL IMAGES)
+# -----------------------------
+def find_last_conv_layer(model):
+    for layer in reversed(model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            return layer.name
+    raise ValueError("No Conv2D layer found.")
+
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
+    grad_model = tf.keras.models.Model(
+        inputs=model.inputs,
+        outputs=[model.get_layer(last_conv_layer_name).output, model.output]
     )
 
-    test_loss, test_acc = model.evaluate(test_generator)
-    print(f"Test Accuracy (Unseen Data): {test_acc:.2%}")
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        class_idx = tf.argmax(predictions[0])
+        loss = predictions[:, class_idx]
 
-    # Predictions and true labels
-    y_pred = model.predict(test_generator)
-    y_pred_classes = np.argmax(y_pred, axis=1)
-    y_true = test_generator.classes
-    class_labels = list(test_generator.class_indices.keys())
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
 
-    # Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred_classes)
-    plt.figure(figsize=(8,6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=class_labels, yticklabels=class_labels)
-    plt.title('Confusion Matrix (Unseen Data)')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.show()
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
 
-    # Classification Report
-    print("\n📋 Classification Report:\n")
-    print(classification_report(y_true, y_pred_classes, target_names=class_labels))
+    heatmap = tf.maximum(heatmap, 0)
+    heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-8)
 
-    # ==============================
-    # 🔍 ROC Curves and AUC
-    # ==============================
-    y_true_cat = to_categorical(y_true, num_classes=len(class_labels))
-    plt.figure(figsize=(7,5))
-    for i, label in enumerate(class_labels):
-        fpr, tpr, _ = roc_curve(y_true_cat[:, i], y_pred[:, i])
-        roc_auc = auc(fpr, tpr)
-        plt.plot(fpr, tpr, label=f"{label} (AUC = {roc_auc:.2f})")
-    plt.plot([0,1], [0,1], 'k--')
-    plt.title('ROC Curves')
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    return heatmap.numpy()
 
-    # ==============================
-    # 🔍 Precision-Recall Curves
-    # ==============================
-    plt.figure(figsize=(7,5))
-    for i, label in enumerate(class_labels):
-        precision, recall, _ = precision_recall_curve(y_true_cat[:, i], y_pred[:, i])
-        plt.plot(recall, precision, label=f"{label}")
-    plt.title('Precision-Recall Curves')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+def save_gradcam(image_path, model, last_conv_layer_name):
+    img = tf.keras.preprocessing.image.load_img(image_path, target_size=IMG_SIZE)
+    img_array = tf.keras.preprocessing.image.img_to_array(img) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
 
-# ==============================
-# 🔟 Save Final Model
-# ==============================
-model.save(MODEL_SAVE_PATH)
-print(f"✅ Model saved at {MODEL_SAVE_PATH}")
+    heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name)
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc, precision_recall_curve
-import numpy as np
+    heatmap_resized = cv2.resize(heatmap, IMG_SIZE)
+    heatmap_uint8 = np.uint8(255 * heatmap_resized)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
 
-# ---- Accuracy/Loss Curves ----
-plt.figure(figsize=(12,5))
-plt.subplot(1,2,1)
-plt.plot(history.history['accuracy'], label='Train Accuracy')
-plt.plot(history.history['val_accuracy'], label='Val Accuracy')
-plt.title('Model Accuracy over Epochs')
-plt.xlabel('Epochs')
-plt.ylabel('Accuracy')
-plt.legend()
+    original = np.array(img).astype(np.uint8)
+    overlay = cv2.addWeighted(original, 0.6, heatmap_color, 0.4, 0)
 
-plt.subplot(1,2,2)
-plt.plot(history.history['loss'], label='Train Loss')
-plt.plot(history.history['val_loss'], label='Val Loss')
-plt.title('Model Loss over Epochs')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
-plt.show()
+    # Plot 3-panel output
+    plt.figure(figsize=(10, 4))
 
-# ---- Predictions ----
-Y_pred = model.predict(test_generator)
-y_pred = np.argmax(Y_pred, axis=1)
+    plt.subplot(1, 3, 1)
+    plt.imshow(original)
+    plt.title("Original")
+    plt.axis("off")
 
-# ---- Confusion Matrix ----
-cm = confusion_matrix(test_generator.classes, y_pred)
-plt.figure(figsize=(8,6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-plt.title('Confusion Matrix')
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.show()
+    plt.subplot(1, 3, 2)
+    plt.imshow(heatmap_color)
+    plt.title("Grad-CAM Heatmap")
+    plt.axis("off")
 
-# ---- Classification Report ----
-print("Classification Report:")
-print(classification_report(test_generator.classes, y_pred, target_names=test_generator.class_indices.keys()))
+    plt.subplot(1, 3, 3)
+    plt.imshow(overlay)
+    plt.title("Overlay")
+    plt.axis("off")
 
-# ---- ROC Curve ----
-from sklearn.preprocessing import label_binarize
-from sklearn.metrics import roc_auc_score
-n_classes = len(test_generator.class_indices)
-y_true_bin = label_binarize(test_generator.classes, classes=range(n_classes))
-fpr, tpr, roc_auc = {}, {}, {}
-for i in range(n_classes):
-    fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], Y_pred[:, i])
-    roc_auc[i] = auc(fpr[i], tpr[i])
+    save_path = os.path.join(GRADCAM_SAVE_DIR, os.path.basename(image_path))
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
 
-plt.figure()
-for i in range(n_classes):
-    plt.plot(fpr[i], tpr[i], label=f'Class {i} (AUC = {roc_auc[i]:.2f})')
-plt.plot([0, 1], [0, 1], 'k--')
-plt.title('ROC Curve')
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.legend()
-plt.show()
+    print("✅ Saved 3-panel Grad-CAM:", save_path)
 
-# ---- Computational Details ----
-import time, psutil, tensorflow as tf
-print(f"Model Parameters: {model.count_params()}")
-print(f"TensorFlow version: {tf.__version__}")
-print(f"System CPU usage: {psutil.cpu_percent()}%")
-print("Training performed on GPU" if tf.config.list_physical_devices('GPU') else "Training performed on CPU")
+# -----------------------------
+# 🧠 Generate Grad-CAM for ALL Test Images
+# -----------------------------
+print("\nGenerating Grad-CAM explanations...")
 
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-import numpy as np
-from sklearn.metrics import classification_report, confusion_matrix
-import seaborn as sns
-import matplotlib.pyplot as plt
+try:
+    last_conv_layer = find_last_conv_layer(model)
+    print("Using last conv layer:", last_conv_layer)
+except:
+    last_conv_layer = "Conv_1"
 
-# Load test images
-test_datagen = ImageDataGenerator(rescale=1./255)
-test_generator = test_datagen.flow_from_directory(
-    "classification_test",
-    target_size=(128, 128),
-    batch_size=32,
-    class_mode='categorical',
-    shuffle=False
-)
+test_images = []
+for root, dirs, files in os.walk(TEST_PATH):
+    for file in files:
+        if file.lower().endswith((".jpg", ".png", ".jpeg")):
+            test_images.append(os.path.join(root, file))
 
-# Evaluate model
-test_loss, test_acc = model.evaluate(test_generator)
-print(f"🧪 Test Accuracy: {test_acc:.2%}")
+print(f"🔍 Found {len(test_images)} test images.")
 
-# Predict
-y_pred = model.predict(test_generator)
-y_pred_classes = np.argmax(y_pred, axis=1)
-y_true = test_generator.classes
-class_labels = list(test_generator.class_indices.keys())
+for img_path in test_images:
+    try:
+        save_gradcam(img_path, model, last_conv_layer)
+    except Exception as e:
+        print("Skipping:", img_path, "Error:", e)
 
-# Confusion Matrix
-cm = confusion_matrix(y_true, y_pred_classes)
-plt.figure(figsize=(8,6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-            xticklabels=class_labels, yticklabels=class_labels)
-plt.title('Confusion Matrix (Test Data)')
-plt.xlabel('Predicted Label')
-plt.ylabel('True Label')
-plt.show()
-
-# Classification Report
-print("\n📋 Classification Report:\n")
-print(classification_report(y_true, y_pred_classes, target_names=class_labels))
-
-# ==============================
-# 🔍 Precision, Recall, F1-Score, ROC, and PR Curves
-# ==============================
-from sklearn.metrics import roc_curve, auc, precision_recall_curve, classification_report
-from sklearn.preprocessing import label_binarize
-
-# Binarize true labels for multi-class ROC/PR
-n_classes = len(class_labels)
-y_true_bin = label_binarize(y_true, classes=range(n_classes))
-
-# ---- 📋 Precision, Recall, F1 per Class ----
-report = classification_report(y_true, y_pred_classes, target_names=class_labels, output_dict=True)
-print("\n📊 Precision, Recall, and F1-Score per Class:")
-for label in class_labels:
-    print(f"{label:15s} | Precision: {report[label]['precision']:.2f} | Recall: {report[label]['recall']:.2f} | F1: {report[label]['f1-score']:.2f}")
-
-# ---- 🧭 ROC Curves ----
-plt.figure(figsize=(8,6))
-for i, label in enumerate(class_labels):
-    fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred[:, i])
-    roc_auc = auc(fpr, tpr)
-    plt.plot(fpr, tpr, label=f"{label} (AUC = {roc_auc:.2f})")
-plt.plot([0,1], [0,1], 'k--')
-plt.title('ROC Curves for Each Class')
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# ---- 🎯 Precision-Recall Curves ----
-plt.figure(figsize=(8,6))
-for i, label in enumerate(class_labels):
-    precision, recall, _ = precision_recall_curve(y_true_bin[:, i], y_pred[:, i])
-    plt.plot(recall, precision, label=f"{label}")
-plt.title('Precision-Recall Curves for Each Class')
-plt.xlabel('Recall')
-plt.ylabel('Precision')
-plt.legend()
-plt.grid(True)
-plt.show()
-
-# ---- 🌟 Macro Averages ----
-roc_auc_macro = np.mean([auc(*roc_curve(y_true_bin[:, i], y_pred[:, i])[:2]) for i in range(n_classes)])
-print(f"\n⭐ Average AUC (macro): {roc_auc_macro:.3f}")
-# --- 📋 Precision, Recall, F1 table ---
-from sklearn.metrics import classification_report
-report = classification_report(y_true, y_pred_classes, target_names=class_labels, output_dict=True)
-print("\n📊 Precision, Recall, and F1-Score per Class:")
-for label in class_labels:
-    print(f"{label:20s} | Precision: {report[label]['precision']:.2f} | Recall: {report[label]['recall']:.2f} | F1: {report[label]['f1-score']:.2f}")
+print("✅ All Grad-CAM results saved in:", GRADCAM_SAVE_DIR)
