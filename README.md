@@ -1,7 +1,16 @@
-# Fetal Abnormality Detection using MobileNetV2 Transfer Learning
+# Fetal Abnormality Detection using MobileNetV2 + Grad-CAM Explainability
+This project detects fetal abnormalities from ultrasound images using MobileNetV2 Transfer Learning.
+Milestone-3 includes Grad-CAM explainability to highlight fetal regions that influence model predictions.
 
-This project focuses on detecting **fetal abnormalities** from ultrasound images using **MobileNetV2** and **Transfer Learning** in **TensorFlow 2.15**.  
-The model classifies images into **normal** and **abnormal** categories based on training data.
+The model produces three outputs for each image:
+
+Original Ultrasound Image
+
+Grad-CAM Heatmap
+
+Overlay (Original + Heatmap)
+
+All visual explanations are saved automatically.
 
 ---
 
@@ -62,6 +71,12 @@ Precision, Recall, F1-Score for each class will be displayed in the terminal.
 Precision–Recall Curve and Confusion Matrix will be displayed as images or saved automatically.
 
 The trained model will be saved inside the saved_model/ directory.
+
+# Grad-CAM Output
+
+The script generates Grad-CAM for ALL test images
+
+Saved inside: outputs folder in your project floder automatically
 
 ###  Reproducibility
 
